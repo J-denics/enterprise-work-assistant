@@ -1,261 +1,321 @@
-"""
-담당: 팀원2 — 문서 처리·화면
-이 파일은 PDF·HWP에서 텍스트와 원문 위치를 추출하는 기능을 구현하기 위해 만들어졌습니다.
-입력: 텍스트 추출이 가능한 PDF 또는 HWP 파일
-출력: 문서명, 문서 형식, 원문 위치, 추출 텍스트를 담은 공통 데이터
-구현할 내용: 형식별 추출, 표 내용 확인, 추출 실패 안내
-PDF는 페이지를, HWP는 확보 가능한 절·문단·표 위치를 보존합니다.
-HWP를 PDF로 변환하는 경우 페이지 번호가 변환본 기준임을 표시합니다.
-"""
+"""PDF/HWP 요구사항 표 추출. 원문을 보존하고 정리본과 검토 경고를 제공합니다."""
 
+import argparse
+import json
 import re
+import sys
+import unicodedata
+from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Any
 
 
-def parse_rfp(file_path: str | Path) -> list[dict[str, str]]:
+ID_LABELS = {"요구사항번호", "요구사항고유번호"}
+DETAIL_LABELS = {"요구사항상세내용", "상세내용", "요구사항세부내용", "세부내용"}
+FOOTER_LABELS = {"산출정보", "관련요구사항", "요구사항출처"}
+CLASS_LABEL = "요구사항분류"
+
+# 원문과 대조해 글머리표임을 확인한 문자만 추가하세요.
+# 예: {"\uf06c"}. 사설 영역 문자 전체나 대체 문자(�)를 일괄 삭제하지 않습니다.
+EXTRA_BULLET_CHARS: set[str] = set()
+
+
+@dataclass
+class TableBlock:
+    location: str
+    rows: list[list[str | None]]
+    hwp_table: Any = None
+    first_page: int = 0
+    last_page: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+
+def compact(text: str | None) -> str:
+    return "".join((text or "").split())
+
+
+def row_label(row: list[str | None]) -> str:
+    return next((compact(cell) for cell in row if cell and cell.strip()), "")
+
+
+def validate_symbol_map(symbol_map: Any) -> dict[str, str]:
+    if not isinstance(symbol_map, dict) or any(
+        not isinstance(key, str) or len(key) != 1
+        or not isinstance(value, str) or not value
+        for key, value in symbol_map.items()
+    ):
+        raise ValueError("기호 치환표는 한 글자 키와 비어 있지 않은 문자열 값의 JSON 객체여야 합니다.")
+    return symbol_map
+
+
+def clean_text(raw: str, *, symbol_map: dict[str, str] | None = None) -> tuple[str, list[str]]:
+    """확실한 서식만 정리합니다. 의미 불명의 문자는 남기고 경고합니다."""
+    # 사설 문자 의미는 문서/폰트에 따라 다르므로 확인한 치환표를 지정했을 때만 적용합니다.
+    mapped = raw.translate(str.maketrans(validate_symbol_map(symbol_map))) if symbol_map is not None else raw
+    text = unicodedata.normalize("NFC", mapped).replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ")
+    notes = []
+    controls = {c for c in text if unicodedata.category(c) == "Cc" and c not in "\n\t"}
+    if controls:
+        codes = ", ".join(f"U+{ord(c):04X}" for c in sorted(controls))
+        notes.append(f"제어문자를 공백으로 바꿈: {codes}. raw_req_text와 원문을 확인하세요.")
+        text = "".join(" " if c in controls else c for c in text)
+
+    # 줄 시작 + 뒤 공백이 있는 글머리표만 ●로 통일합니다. %, ≥, ≤, ① 등은 유지합니다.
+    bullets = "•●▪‣⁃" + "".join(sorted(EXTRA_BULLET_CHARS))
+    text = re.sub(r"^([ \t]*)[" + re.escape(bullets) + r"](?=[ \t]|$)", r"\1●", text, flags=re.M)
+    unknown = {c for c in text if c == "\ufffd" or unicodedata.category(c) in {"Co", "Cs", "Cf"}}
+    if unknown:
+        codes = ", ".join(f"U+{ord(c):04X}" for c in sorted(unknown))
+        notes.append(f"원문/폰트 확인이 필요한 문자를 보존함: {codes}")
+    if re.search(r"\(cid:\d+\)", text):
+        notes.append("PDF 문자 매핑 실패 가능성: (cid:숫자) 표기를 원문과 대조하세요.")
+    return text, notes
+
+
+def source_ids(rows: list[list[str | None]]) -> set[str]:
+    found = set()
+    for row in rows:
+        for col, cell in enumerate(row[:-1]):
+            if compact(cell) in ID_LABELS:
+                value = next((compact(v) for v in row[col + 1:] if v and v.strip()), "")
+                if not re.fullmatch(r"[A-Z]+-[0-9]+", value):
+                    raise ValueError(f"요구사항 원본 번호 형식을 확인하세요: {value!r}")
+                found.add(value)
+    return found
+
+
+def split_sections(rows: list[list[str | None]]):
+    """앞쪽의 이어지는 본문을 보존하고, 붙어 있는 새 요구사항 표를 나눕니다."""
+    section = []
+    has_id = False
+    for row in rows:
+        contains_id = any(compact(cell) in ID_LABELS for cell in row[:-1])
+        # 분류 행 없이 새 번호가 시작해도 앞의 연속 본문을 별도 구간으로 남깁니다.
+        new_id = contains_id and (has_id or not any(row_label(r) == CLASS_LABEL for r in section))
+        if section and (row_label(row) == CLASS_LABEL or new_id):
+            yield section
+            section = []
+            has_id = False
+        section.append(row)
+        has_id = has_id or contains_id
+    if section:
+        yield section
+
+
+def continuation_rows(rows: list[list[str | None]]) -> list[list[str | None]]:
+    # 종료 항목이 없으면 전체를 본문 후보로 사용합니다. rows[:0]으로 버리지 않습니다.
+    end = next((i for i, row in enumerate(rows) if row_label(row) in FOOTER_LABELS), len(rows))
+    body = []
+    for row in rows[:end]:
+        cells = [(i, c) for i, c in enumerate(row) if c and c.strip()]
+        if not cells:
+            continue
+        if compact(cells[0][1]) in DETAIL_LABELS:
+            values = [c for _, c in cells[1:] if compact(c) not in DETAIL_LABELS]
+            if values:
+                body.append(["세부내용", "\t".join(values)])
+        elif len(cells) == 1 and cells[0][0] == len(row) - 1:
+            body.append(["세부내용", cells[0][1]])
+        else:
+            raise ValueError("이전 요구사항의 연속인지 판단하기 어려운 표입니다. 원문을 확인하세요.")
+    return body
+
+
+def read_pdf(path: Path) -> list[TableBlock]:
+    import pdfplumber
+
+    blocks = []
+    pending = None
+    with pdfplumber.open(path) as doc:
+        for number, page in enumerate(doc.pages, start=1):
+            try:
+                page_tables = page.extract_tables()
+            finally:
+                page.close()
+            for rows in page_tables:
+                for section in split_sections(rows):
+                    if not any(cell and cell.strip() for row in section for cell in row):
+                        continue
+                    ids = source_ids(section)
+                    has_footer = any(row_label(row) in FOOTER_LABELS for row in section)
+                    if ids:
+                        # 다음 페이지에 같은 요구사항 번호가 반복된 경우도 연결합니다.
+                        repeated_header = (
+                            pending is not None
+                            and number == pending.last_page + 1
+                            and ids == source_ids(pending.rows)
+                        )
+                        if repeated_header:
+                            pending.rows.extend(section)
+                        else:
+                            pending = TableBlock(f"p.{number}", section, first_page=number, last_page=number)
+                            blocks.append(pending)
+                    elif pending is not None:
+                        if number not in {pending.last_page, pending.last_page + 1}:
+                            raise ValueError(f"p.{number}: 이어지는 요구사항 사이에 페이지가 빠졌습니다.")
+                        try:
+                            body = continuation_rows(section)
+                        except ValueError as error:
+                            raise ValueError(f"p.{number}: {error}") from error
+                        if not body and not has_footer:
+                            raise ValueError(f"p.{number}: 이어지는 본문을 확인할 수 없습니다.")
+                        pending.rows.extend(body)
+                    else:
+                        # 일반 표는 뒤에서 제외하고, 번호 없는 상세내용 표는 오류로 알립니다.
+                        blocks.append(TableBlock(f"p.{number}", section))
+                        continue
+
+                    pending.last_page = number
+                    pending.location = (
+                        f"p.{pending.first_page}" if pending.first_page == number
+                        else f"p.{pending.first_page}–{number}"
+                    )
+                    if has_footer:
+                        pending = None
+
+            if pending is not None and pending.last_page < number:
+                raise ValueError(f"p.{number}: 이전 요구사항이 끝나지 않았지만 이어지는 표를 추출하지 못했습니다.")
+    if pending is not None:
+        pending.warnings.append("문서 끝에서 요구사항 종료 항목을 찾지 못했습니다. 본문 완전성을 확인하세요.")
+    return blocks
+
+
+def read_hwp(path: Path) -> list[TableBlock]:
+    from hwpx import HwpxDocument
+
+    doc = HwpxDocument.open(path)
+    tables = doc.tables.with_nested
+    blocks = []
+    for entry in doc.tables.map()["tables"]:
+        rows = [[None] * entry["cols"] for _ in range(entry["rows"])]
+        for cell in entry["cells"]:
+            rows[cell["row"]][cell["col"]] = cell["text"]
+        index = entry["table_index"]
+        blocks.append(TableBlock(f"표 {index + 1}", rows, tables[index]))
+    return blocks
+
+
+def parse_rfp(file_path: str | Path, *, symbol_map: dict[str, str] | None = None) -> list[dict[str, Any]]:
     path = Path(file_path)
     doc_type = path.suffix[1:].upper()
-
-    # 두 형식의 표를 (원문 위치, 행 목록, HWP 표 객체) 형태로 모읍니다.
-    tables = []
-    id_labels = {"요구사항번호", "요구사항고유번호"}
-
-    if doc_type == "HWP":
-        from hwpx import HwpxDocument
-
-        doc = HwpxDocument.open(path)
-        hwp_tables = doc.tables.with_nested
-
-        # HWP 셀의 행·열 좌표를 사용해 표를 2차원 리스트로 구성합니다.
-        # 원본 표 객체는 중첩 표를 읽을 때 사용합니다.
-        for entry in doc.tables.map()["tables"]:
-            rows = [[None] * entry["cols"] for _ in range(entry["rows"])]
-            for cell in entry["cells"]:
-                rows[cell["row"]][cell["col"]] = cell["text"]
-
-            index = entry["table_index"]
-            tables.append((f"표 {index + 1}", rows, hwp_tables[index]))
-
-    elif doc_type == "PDF":
-        import pdfplumber
-
-        footer_labels = {"산출정보", "관련요구사항", "요구사항출처"}
-        unfinished = None
-
-        with pdfplumber.open(path) as doc:
-            for page_number, page in enumerate(doc.pages, start=1):
-                # 표의 셀을 읽고, 사용한 페이지의 좌표 캐시를 비웁니다.
-                page_tables = page.extract_tables()
-                page.close()
-
-                for rows in page_tables:
-                    labels = [
-                        next(
-                            (
-                                "".join(cell.split())
-                                for cell in row
-                                if cell and cell.strip()
-                            ),
-                            "",
-                        )
-                        for row in rows
-                    ]
-                    headings = [
-                        index
-                        for index, label in enumerate(labels)
-                        if label == "요구사항분류"
-                    ]
-
-                    # 다음 쪽의 표가 번호 없이 본문과 산출 정보로 끝나면
-                    # 직전 쪽에서 끝나지 않은 요구사항의 연속으로 처리합니다.
-                    if unfinished is not None and not headings:
-                        previous_page, previous_index, previous_rows = unfinished
-                        footer_start = next(
-                            (
-                                index
-                                for index, label in enumerate(labels)
-                                if label in footer_labels
-                            ),
-                            0,
-                        )
-                        body_rows = rows[:footer_start]
-
-                        if (
-                            page_number == previous_page + 1
-                            and body_rows
-                            and all(
-                                len(row) >= 2
-                                and not any(cell and cell.strip() for cell in row[:-1])
-                                for row in body_rows
-                            )
-                        ):
-                            previous_rows.extend(
-                                ["세부내용", row[-1]]
-                                for row in body_rows
-                                if row[-1] and row[-1].strip()
-                            )
-                            tables[previous_index] = (
-                                f"p.{previous_page}–{page_number}",
-                                previous_rows,
-                                None,
-                            )
-                            unfinished = None
-                            continue
-
-                    # 붙어 있는 표가 하나로 감지되면 새 분류 행에서 나눕니다.
-                    boundaries = [0, *headings[1:], len(rows)]
-                    for start, end in zip(boundaries, boundaries[1:]):
-                        section = rows[start:end]
-                        section_labels = set(labels[start:end])
-
-                        if section_labels & id_labels:
-                            unfinished = None
-                            if not section_labels & footer_labels:
-                                unfinished = (page_number, len(tables), section)
-
-                        tables.append((f"p.{page_number}", section, None))
-
+    if doc_type == "PDF":
+        blocks = read_pdf(path)
+    elif doc_type == "HWP":
+        blocks = read_hwp(path)
     else:
         raise ValueError("지원 형식은 .hwp와 .pdf입니다.")
 
-    detail_labels = {"요구사항상세내용", "상세내용", "요구사항세부내용", "세부내용"}
     result = []
-    seen_source_ids = set()
-
-    # 표 하나를 요구사항 한 건의 후보로 보고 번호와 상세내용을 찾습니다.
-    for location, rows, hwp_table in tables:
-        source_ids = set()
+    seen = set()
+    for block in blocks:
+        ids = source_ids(block.rows)
         details = []
+        for row_number, row in enumerate(block.rows):
+            # 중첩된 상세내용 라벨이 있으면 오른쪽의 마지막 라벨을 사용합니다.
+            label_cols = [i for i, cell in enumerate(row[:-1]) if compact(cell) in DETAIL_LABELS]
+            if not label_cols:
+                continue
+            col = label_cols[-1]
+            for value_col in range(col + 1, len(row)):
+                value = row[value_col]
+                if value and value.strip():
+                    break
+            else:
+                continue
+            if block.hwp_table is not None:
+                cell = block.hwp_table.cell(row_number, value_col)
+                if cell.tables:
+                    parts = []
+                    for paragraph in cell.paragraphs:
+                        parts.append(paragraph.text or "")
+                        for nested in paragraph.tables:
+                            parts.extend("\t".join(c.text or "" for c in r.cells) for r in nested.rows)
+                    value = "\n".join(parts)
+            details.append(value)
 
-        for row_number, row in enumerate(rows):
-            for col, cell_text in enumerate(row[:-1]):
-                # 라벨에 들어간 공백과 줄바꿈을 무시해 같은 항목명으로 인식합니다.
-                label = "".join((cell_text or "").split())
-                if label not in id_labels and label not in detail_labels:
-                    continue
-
-                # 같은 행에서 라벨 오른쪽의 첫 번째 비어 있지 않은 셀을 값으로 사용합니다.
-                for value_col in range(col + 1, len(row)):
-                    value = row[value_col]
-                    if value and value.strip():
-                        break
-                else:
-                    continue
-
-                if label in id_labels:
-                    source_id = "".join(value.split())
-                    if re.fullmatch(r"[A-Z]+-[0-9]+", source_id):
-                        source_ids.add(source_id)
-                    continue
-
-                # HWP 본문에 작은 표가 들어 있으면 그 텍스트도 본문에 포함합니다.
-                # 각 행은 줄바꿈, 행 안의 셀은 탭으로 구분합니다.
-                if hwp_table is not None:
-                    cell = hwp_table.cell(row_number, value_col)
-                    if cell.tables:
-                        parts = []
-                        for paragraph in cell.paragraphs:
-                            parts.append(paragraph.text or "")
-                            for nested in paragraph.tables:
-                                parts.extend(
-                                    "\t".join(c.text for c in nested_row.cells)
-                                    for nested_row in nested.rows
-                                )
-                        value = "\n".join(parts)
-
-                details.append(value)
-
-        # 두 항목이 모두 없는 일반 표는 건너뜁니다.
-        # 요구사항 후보에는 원본 번호 하나와 상세내용이 필요합니다.
-        if not source_ids and not details:
+        if not ids and not details:
             continue
-        if len(source_ids) != 1 or not details:
-            raise ValueError(
-                f"{location}에서 요구사항 번호와 상세내용을 짝지을 수 없습니다."
-            )
-
-        # 원본 번호로 문서 안의 중복을 확인하고, 출력용 req_id는 순서대로 붙입니다.
-        source_id = next(iter(source_ids))
-        if source_id in seen_source_ids:
-            raise ValueError(f"{location}에서 요구사항 {source_id}가 반복됩니다.")
-        seen_source_ids.add(source_id)
-
-        result.append(
-            {
-                "req_id": f"REQ-{len(result) + 1:03d}",
-                "doc_name": path.name,
-                "doc_type": doc_type,
-                "source_location": location,
-                "req_text": "\n".join(details),
-            }
-        )
-
+        if len(ids) != 1 or not details:
+            raise ValueError(f"{block.location}: 요구사항 번호와 상세내용을 짝지을 수 없습니다.")
+        source_id = next(iter(ids))
+        if source_id in seen:
+            raise ValueError(f"{block.location}: 요구사항 {source_id}가 반복됩니다.")
+        seen.add(source_id)
+        raw = "\n".join(details)
+        cleaned, notes = clean_text(raw, symbol_map=symbol_map)
+        result.append({
+            "req_id": f"REQ-{len(result) + 1:03d}",
+            "source_req_id": source_id,
+            "doc_name": path.name,
+            "doc_type": doc_type,
+            "source_location": block.location,
+            "req_text": cleaned,
+            "raw_req_text": raw,
+            "warnings": block.warnings + notes,
+        })
     if not result:
-        raise ValueError(
-            "문서에서 요구사항 번호와 상세내용이 있는 표를 찾지 못했습니다."
-        )
-
+        raise ValueError("문서에서 요구사항 번호와 상세내용이 있는 표를 찾지 못했습니다.")
     return result
 
 
-if __name__ == "__main__":
-    import json
-    import sys
-    from tempfile import TemporaryDirectory
-
-    # 현재 터미널 위치와 상관없이 이 스크립트가 있는 src/에서 data/를 찾습니다.
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--overwrite", action="store_true", help="기존 JSON도 다시 생성")
+    parser.add_argument("--symbol-map", type=Path, help="원문과 대조한 문서용 기호 치환표 JSON")
+    parser.add_argument("--file", type=Path, help="input 폴더 전체 대신 지정한 PDF/HWP 한 파일만 처리")
+    args = parser.parse_args()
+    symbol_map = None
+    if args.symbol_map is not None:
+        if args.file is None:
+            parser.error("문서별 기호 치환표는 --file로 지정한 한 파일에만 적용하세요.")
+        try:
+            symbol_map = validate_symbol_map(json.loads(args.symbol_map.read_text(encoding="utf-8-sig")))
+        except (OSError, UnicodeError, ValueError) as error:
+            parser.error(f"기호 치환표를 읽을 수 없습니다: {error}")
     data_dir = Path(__file__).resolve().parent / "data"
-    input_dir = data_dir / "input"
-    output_dir = data_dir / "output"
-
-    if not input_dir.is_dir():
-        raise SystemExit(f"입력 폴더를 찾을 수 없습니다. {input_dir}")
-
+    input_dir, output_dir = data_dir / "input", data_dir / "output"
+    if args.file is not None:
+        if not args.file.is_file() or args.file.suffix.lower() not in {".hwp", ".pdf"}:
+            parser.error("--file에는 존재하는 PDF/HWP 파일을 지정하세요.")
+        sources = [args.file]
+    elif not input_dir.is_dir():
+        parser.exit(1, f"입력 폴더를 만들고 PDF/HWP를 넣어주세요: {input_dir}\n")
+    else:
+        sources = sorted(input_dir.iterdir())
     output_dir.mkdir(parents=True, exist_ok=True)
-    created = 0
-    skipped = 0
-    failed = 0
-
-    # input 폴더 바로 아래의 HWP·PDF 파일을 이름순으로 확인합니다.
-    for source_path in sorted(input_dir.iterdir()):
-        suffix = source_path.suffix.lower()
-        if not source_path.is_file() or suffix not in {".hwp", ".pdf"}:
+    created = skipped = failed = 0
+    for source in sources:
+        suffix = source.suffix.lower()
+        if not source.is_file() or suffix not in {".hwp", ".pdf"}:
             continue
-
-        # HWP는 기존 JSON 이름을 사용하고, PDF는 .pdf를 남겨 같은 제목의 HWP와 구분합니다.
-        output_name = source_path.stem if suffix == ".hwp" else source_path.name
-        output_path = output_dir / f"{output_name}.requirements.json"
-
-        # 대응하는 JSON이 있으면 해당 입력의 파싱을 생략합니다.
-        if output_path.is_file():
-            print(f"건너뜀 {source_path.name} → {output_path.name}")
+        name = source.stem if suffix == ".hwp" else source.name
+        output_path = output_dir / f"{name}.requirements.json"
+        if output_path.is_file() and not args.overwrite:
+            print(f"건너뜀 {source.name} (--overwrite로 다시 생성 가능)")
             skipped += 1
             continue
-
         try:
-            result = parse_rfp(source_path)
-
-            # JSON을 임시 파일에 모두 쓴 뒤 결과 경로로 옮깁니다.
-            # 쓰기가 실패하면 최종 경로에 미완성 JSON이 남지 않습니다.
+            result = parse_rfp(source, symbol_map=symbol_map)
             with TemporaryDirectory(dir=output_dir) as temp_dir:
                 temp_path = Path(temp_dir) / output_path.name
                 with temp_path.open("w", encoding="utf-8") as output_file:
                     json.dump(result, output_file, ensure_ascii=False, indent=2)
                     output_file.write("\n")
-
                 temp_path.replace(output_path)
-
         except Exception as error:
-            # 개별 파일의 오류를 기록한 뒤 다음 입력을 처리합니다.
-            print(f"실패 {source_path.name} → {error}", file=sys.stderr)
+            print(f"실패 {source.name} → {error}", file=sys.stderr)
             failed += 1
             continue
-
-        print(f"저장 {source_path.name} → {output_path.name} ({len(result)}건)")
         created += 1
-
+        print(f"저장 {source.name} → {output_path.name} ({len(result)}건)")
+        for item in result:
+            for note in item["warnings"]:
+                print(f"검토 {source.name} / {item['source_req_id']}: {note}", file=sys.stderr)
     print(f"파일 기준 · 생성 {created}개 · 건너뜀 {skipped}개 · 실패 {failed}개")
+    return 1 if failed else 0
 
-    # 전체 처리를 마친 뒤 실패가 있었다면 종료 코드 1로 알립니다.
-    if failed:
-        raise SystemExit(1)
+
+if __name__ == "__main__":
+    raise SystemExit(main())
