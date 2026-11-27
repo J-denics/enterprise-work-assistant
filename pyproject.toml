@@ -8,4 +8,5 @@ dependencies = [
     "pdfplumber==0.11.9",
     "pymupdf>=2.2",
     "python-hwpx>=7.0.1,<8",
+    "streamlit>=1.67.0",
 ]
